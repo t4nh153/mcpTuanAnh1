@@ -3,5 +3,3 @@ websockets
 requests
 beautifulsoup4
 lxml
-uvicorn
-fastapi

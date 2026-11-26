@@ -15,15 +15,16 @@ import threading
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("xiaozhi-khkt-music")
 
-app = FastAPI(title="Xiaozhi KHKT Music + MCP Server", version="3.2.0")
+app = FastAPI(title="Xiaozhi KHKT Music + MCP Server", version="3.5.0")
 
+UPSTREAM_TVBOX_API = os.environ.get("UPSTREAM_API", "https://xiaozhi-music-api.onrender.com").rstrip("/")
 RAW_COOKIE_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
 RUNTIME_COOKIE_FILE = "/tmp/cookies.txt"
 
 MUSIC_CACHE = {}
 STREAM_SESSION = {}
 CACHE_LOCK = threading.Lock()
-CACHE_TTL = 7200  # Lưu đệm 2 giờ (tránh link hết hạn)
+CACHE_TTL = 7200  # Lưu đệm 2 giờ
 
 
 def prepare_cookie_file():
@@ -46,6 +47,7 @@ def get_cached_music(query: str):
         if clean_k in MUSIC_CACHE:
             data, exp = MUSIC_CACHE[clean_k]
             if time.time() < exp:
+                logger.info(f"[CACHE HIT] '{clean_k}'")
                 return data.copy()
             del MUSIC_CACHE[clean_k]
     return None
@@ -64,16 +66,16 @@ def set_cached_music(query: str, data: dict):
         MUSIC_CACHE[clean_k] = (data.copy(), now + CACHE_TTL)
 
 
-def can_server_fetch_url(url: str, headers: dict) -> bool:
-    """Kiểm tra nhanh xem IP Render có đọc được luồng nhạc không (chống lỗi 403 khóa IP)"""
+def can_server_fetch_url(url: str, headers: dict = None) -> bool:
+    """Đọc thử 512 byte đầu tiên để đảm bảo 100% luồng nhạc không bị chặn IP (403)"""
     try:
         h = dict(headers or {"User-Agent": "Mozilla/5.0"})
-        h["Range"] = "bytes=0-1024"
         req = urllib.request.Request(url, headers=h)
         with urllib.request.urlopen(req, timeout=5) as r:
-            return r.status in (200, 206)
+            chunk = r.read(512)
+            return r.status in (200, 206) and len(chunk) > 0
     except Exception as e:
-        logger.warning(f"Link bị chặn IP trên Render ({e})")
+        logger.warning(f"URL bị chặn đọc trực tiếp ({e})")
         return False
 
 
@@ -122,6 +124,10 @@ def find_best_progressive_audio(formats: list) -> dict:
     return candidates[0][2]
 
 
+# =====================================================================
+# BỘ ĐIỀU PHỐI 3 TẦNG:
+# 1A. YouTube trực tiếp (Android_VR / Cookie) -> 1B. YouTube Upstream Proxy -> 2. SoundCloud
+# =====================================================================
 def extract_music(query: str):
     cached = get_cached_music(query)
     if cached:
@@ -129,49 +135,88 @@ def extract_music(query: str):
 
     cookie_path = prepare_cookie_file()
 
-    # TẦNG 1: Nếu đã gắn cookies.txt vào Secret Files trên Render -> Bóc trực tiếp YouTube đúng IP Render!
+    # TẦNG 1A: Hỏi trực tiếp YouTube ngay trên IP Render
+    ydl_yt = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "socket_timeout": 7,
+        "extractor_args": {"youtube": {"player_client": ["android_vr", "tv", "ios"]}},
+    }
     if cookie_path:
-        ydl_yt = {
-            "format": "bestaudio/best",
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "socket_timeout": 8,
-            "cookiefile": cookie_path,
-        }
-        try:
-            with yt_dlp.YoutubeDL(ydl_yt) as ydl:
-                info = ydl.extract_info(f"ytsearch1:{query}", download=False)
-                entries = info.get("entries", []) if info else []
-                if entries:
-                    v = entries[0]
-                    best_fmt = find_best_progressive_audio(v.get("formats", [])) or v
-                    headers = best_fmt.get("http_headers") or {"User-Agent": "Mozilla/5.0"}
-                    if best_fmt.get("url") and can_server_fetch_url(best_fmt["url"], headers):
-                        res = {
-                            "source": "youtube",
-                            "title": v.get("title", query),
-                            "artist": v.get("uploader", "YouTube"),
-                            "duration": v.get("duration", 0),
-                            "ext": (best_fmt.get("ext") or "m4a").lower(),
-                            "headers": headers,
-                            "url": best_fmt["url"],
-                        }
-                        logger.info(f"[YOUTUBE DIRECT] Thành công: {res['title']}")
-                        set_cached_music(query, res)
-                        return res
-        except Exception as e:
-            logger.warning(f"[YOUTUBE DIRECT] Lỗi ({e}) -> Chuyển sang SoundCloud...")
+        ydl_yt["cookiefile"] = cookie_path
 
-    # TẦNG 2 (Mặc định siêu tốc, sạch quảng cáo, không cần cookie, trùng 100% IP Render): SoundCloud
+    try:
+        with yt_dlp.YoutubeDL(ydl_yt) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{query}", download=False)
+            entries = info.get("entries", []) if info else []
+            if entries:
+                v = entries[0]
+                best_fmt = find_best_progressive_audio(v.get("formats", [])) or v
+                headers = best_fmt.get("http_headers") or {"User-Agent": "Mozilla/5.0"}
+                url = best_fmt.get("url", "")
+                if url and can_server_fetch_url(url, headers):
+                    res = {
+                        "source": "youtube_direct",
+                        "title": v.get("title", query),
+                        "artist": v.get("uploader", "YouTube"),
+                        "duration": v.get("duration", 0),
+                        "ext": (best_fmt.get("ext") or "m4a").lower(),
+                        "headers": headers,
+                        "url": url,
+                    }
+                    logger.info(f"[TẦNG 1A - YOUTUBE TRỰC TIẾP] Thành công: {res['title']}")
+                    set_cached_music(query, res)
+                    return res
+    except Exception as e:
+        logger.warning(f"[TẦNG 1A] YouTube trực tiếp lỗi ({e}) -> Gọi sang Upstream TV Box...")
+
+    # TẦNG 1B: Gọi qua API TV Box bên kia + Bọc cổng /stream chống khóa IP 403
+    if UPSTREAM_TVBOX_API:
+        try:
+            api_url = f"{UPSTREAM_TVBOX_API}/play?q={urllib.parse.quote(query)}"
+            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                if resp.status == 200:
+                    body = json.loads(resp.read().decode("utf-8"))
+                    if body.get("status") == "success" and body.get("data", {}).get("url"):
+                        d = body["data"]
+                        raw_u = d["url"]
+                        usable_url = None
+
+                        if can_server_fetch_url(raw_u):
+                            usable_url = raw_u
+                        else:
+                            relayed = f"{UPSTREAM_TVBOX_API}/stream?m3u8={urllib.parse.quote(raw_u, safe='')}"
+                            if can_server_fetch_url(relayed):
+                                usable_url = relayed
+
+                        if usable_url:
+                            res = {
+                                "source": f"youtube_upstream_{d.get('source', 'api')}",
+                                "title": d.get("title", query),
+                                "artist": "YouTube Music",
+                                "duration": d.get("duration", 0),
+                                "ext": "mp3",
+                                "headers": {"User-Agent": "Mozilla/5.0"},
+                                "url": usable_url,
+                            }
+                            logger.info(f"[TẦNG 1B - YOUTUBE UPSTREAM] Thành công: {res['title']}")
+                            set_cached_music(query, res)
+                            return res
+        except Exception as e:
+            logger.warning(f"[TẦNG 1B] Upstream lỗi ({e}) -> Chuyển sang dự phòng SoundCloud...")
+
+    # TẦNG 2 (Dự phòng an toàn cuối cùng): SoundCloud
     ydl_sc = {
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "socket_timeout": 10,
+        "socket_timeout": 8,
     }
     try:
         with yt_dlp.YoutubeDL(ydl_sc) as ydl:
@@ -179,52 +224,34 @@ def extract_music(query: str):
             for v in (info.get("entries") or []):
                 if not v:
                     continue
-                # Bỏ qua các bản preview ngắn 30 giây nếu có bản đầy đủ
                 if (v.get("duration") or 0) > 0 and v.get("duration") < 40:
                     continue
-                best_fmt = find_best_progressive_audio(v.get("formats", []))
-                target = best_fmt if best_fmt else v
-                url = target.get("url", "")
-                if url and not is_hls_or_manifest(url, target.get("protocol", "")):
-                    headers = target.get("http_headers") or {"User-Agent": "Mozilla/5.0"}
+                best_fmt = find_best_progressive_audio(v.get("formats", [])) or v
+                url = best_fmt.get("url") or (v["formats"][-1]["url"] if v.get("formats") else "")
+                if url:
                     res = {
-                        "source": "soundcloud",
+                        "source": "soundcloud_backup",
                         "title": v.get("title", query),
                         "artist": v.get("uploader", "SoundCloud"),
                         "duration": v.get("duration", 0),
-                        "ext": (target.get("ext") or "mp3").lower(),
-                        "headers": headers,
+                        "ext": "mp3",
+                        "headers": best_fmt.get("http_headers") or {"User-Agent": "Mozilla/5.0"},
                         "url": url,
                     }
-                    logger.info(f"[SOUNDCLOUD] Thành công: {res['title']}")
+                    logger.info(f"[TẦNG 2 - SOUNDCLOUD] Thành công: {res['title']}")
                     set_cached_music(query, res)
                     return res
-                # Nếu SoundCloud trả HLS m3u8, FFmpeg trên Render vẫn đọc và nén sang MP3 mượt 100%!
-                if v.get("formats"):
-                    f0 = v["formats"][-1]
-                    if f0.get("url"):
-                        res = {
-                            "source": "soundcloud_hls_to_mp3",
-                            "title": v.get("title", query),
-                            "artist": v.get("uploader", "SoundCloud"),
-                            "duration": v.get("duration", 0),
-                            "ext": "mp3",
-                            "headers": f0.get("http_headers") or {"User-Agent": "Mozilla/5.0"},
-                            "url": f0["url"],
-                        }
-                        logger.info(f"[SOUNDCLOUD FFMPEG] Thành công: {res['title']}")
-                        set_cached_music(query, res)
-                        return res
     except Exception as e:
-        logger.error(f"[SOUNDCLOUD] Lỗi: {e}")
+        logger.error(f"[TẦNG 2] SoundCloud lỗi: {e}")
 
     return None
 
 
-def create_stream_session(track: dict, lyrics: str = "") -> tuple:
+def create_stream_session(track: dict, query: str = "") -> tuple:
     sid = uuid.uuid4().hex[:10]
     with CACHE_LOCK:
-        STREAM_SESSION[sid] = {**track, "lyrics": lyrics, "ts": time.time()}
+        STREAM_SESSION[sid] = {**track, "query": query, "lyrics": None, "ts": time.time()}
+    # Trả đường dẫn tương đối bắt đầu bằng "/" để khớp 100% với esp32_music.cc
     return f"/proxy_mp3?id={sid}", f"/proxy_lyric?id={sid}"
 
 
@@ -234,7 +261,7 @@ def home():
         cnt = len(MUSIC_CACHE)
     return {
         "status": "online",
-        "version": "3.2.0",
+        "version": "3.5.0 (Fast Response + YouTube First)",
         "ffmpeg_ready": bool(shutil.which("ffmpeg")),
         "cookie_loaded": bool(prepare_cookie_file()),
         "cached_songs": cnt,
@@ -248,8 +275,8 @@ def stream_pcm(song: str = Query(...), artist: str = Query("")):
     if not res:
         raise HTTPException(status_code=404, detail="Không tìm thấy bài hát")
 
-    lyrics = fetch_lrclib_lyrics(q) or f"[00:00.00]{res['title']} - {res['artist']}"
-    audio_rel_path, lyric_rel_path = create_stream_session(res, lyrics)
+    # Trả kết quả ngay lập tức để ESP32 không bị HTTP Timeout; lời bài hát tải sau ở /proxy_lyric
+    audio_rel_path, lyric_rel_path = create_stream_session(res, q)
 
     return {
         "title": res["title"],
@@ -266,7 +293,7 @@ def play_json(request: Request, q: str = Query(...)):
     res = extract_music(q)
     if not res:
         raise HTTPException(status_code=404, detail="Không tìm thấy bài hát")
-    audio_rel_path, _ = create_stream_session(res)
+    audio_rel_path, _ = create_stream_session(res, q)
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     host = request.headers.get("host", request.url.netloc)
     return {
@@ -285,7 +312,7 @@ def play_redirect(request: Request, q: str = Query(...)):
     res = extract_music(q)
     if not res:
         raise HTTPException(status_code=404, detail="Không tìm thấy bài hát")
-    audio_rel_path, _ = create_stream_session(res)
+    audio_rel_path, _ = create_stream_session(res, q)
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     host = request.headers.get("host", request.url.netloc)
     return RedirectResponse(url=f"{proto}://{host}{audio_rel_path}", status_code=302)
@@ -321,7 +348,8 @@ def proxy_mp3(id: str = Query(...)):
                     break
                 yield chunk
         finally:
-            proc.terminate()
+            if proc.poll() is None:
+                proc.terminate()
 
     return StreamingResponse(generate_mp3(), media_type="audio/mpeg")
 
@@ -330,6 +358,16 @@ def proxy_mp3(id: str = Query(...)):
 def proxy_lyric(id: str = Query(...)):
     with CACHE_LOCK:
         track = STREAM_SESSION.get(id)
-    if not track or not track.get("lyrics"):
+    if not track:
         return PlainTextResponse("[00:00.00]Đang phát nhạc...")
-    return PlainTextResponse(track["lyrics"])
+
+    if track.get("lyrics") is None:
+        q = track.get("query") or track.get("title", "")
+        lyrics = fetch_lrclib_lyrics(q) or f"[00:00.00]{track.get('title', '')} - {track.get('artist', '')}"
+        with CACHE_LOCK:
+            if id in STREAM_SESSION:
+                STREAM_SESSION[id]["lyrics"] = lyrics
+    else:
+        lyrics = track["lyrics"]
+
+    return PlainTextResponse(lyrics)
